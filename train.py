@@ -1,414 +1,563 @@
-# train.py
 import os
 import math
+import time
 import argparse
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
-import pandas as pd
-import matplotlib.pyplot as plt
-from torch.cuda.amp import autocast, GradScaler
 
-from dataset import ESGDataset
-from model import SlotESGSingleTaskSimple  # 單任務、無圖、保留 slot 的模型
+# local modules (assume these exist)
+from dataset_v2 import GraphESGDataset
+from model import DynScan
+from dataloader import build_loaders
 
-# ---------------- Utils ----------------
-def set_seed(seed: int = 42):
-    import random, numpy as np
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+# -----------------------
+# default hyperparams (can be overridden by CLI)
+# -----------------------
+SEED = 2025
+GRAD_CLIP = 1.0
+
+# -----------------------
+# utilities
+# -----------------------
+def set_seed(seed: int = SEED):
+    import random, numpy as _np
+    random.seed(seed)
+    _np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-def parse_year_span(span: str) -> range:
-    # "2015-2019" -> range(2015, 2020)
-    a, b = span.split("-")
-    return range(int(a), int(b) + 1)
+def ensure_batch_dim(t: torch.Tensor) -> torch.Tensor:
+    """
+    If tensor shape is [K,N,D] (3D), make it [B=1,K,N,D].
+    If already has batch dim (4D), return as-is.
+    """
+    if t is None:
+        return None
+    if not torch.is_tensor(t):
+        return t
+    if t.dim() == 3:
+        return t.unsqueeze(0)
+    return t
 
-def sMAPE(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
-    with torch.no_grad():
-        p = pred.detach().cpu()
-        t = target.detach().cpu()
-        return (100 * torch.mean(torch.abs(p - t) / ((torch.abs(p) + torch.abs(t)) / 2 + eps))).item()
-
-def create_loader(ds_or_subset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True, drop_last=False):
-    return DataLoader(
-        ds_or_subset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-    )
-
-def filter_indices_by_year_and_label(dataset: ESGDataset, years: range) -> List[int]:
-    idx = []
-    for i, s in enumerate(dataset.samples):
-        if s["year"] in years and ("label" in s) and (s["label"] is not None):
-            t = s["label"]
-            if torch.is_tensor(t):
-                if torch.isnan(t).any():  # 跳過 NaN 標籤
-                    continue
-            idx.append(i)
-    return idx
-
-def build_year_loaders(dataset: ESGDataset, years: range, batch_size: int,
-                       num_workers=4, pin_memory=True) -> Dict[int, DataLoader]:
-    """為每個年份建立一個 DataLoader，方便逐年評估。"""
+def move_to_device(batch: dict, device: torch.device) -> dict:
     out = {}
-    for y in years:
-        idx = [i for i, s in enumerate(dataset.samples) if s["year"] == y and s.get("label") is not None]
-        if len(idx) == 0:
-            continue
-        subset = Subset(dataset, idx)
-        out[y] = create_loader(subset, batch_size=batch_size, shuffle=False,
-                               num_workers=num_workers, pin_memory=pin_memory)
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
     return out
 
-# ---------------- Loss / Train Step ----------------
-def forward_and_loss(
-    model: nn.Module,
-    batch: Dict[str, torch.Tensor],
-    device: torch.device,
-    use_regs: bool,
-    lambd_intra: float,
-    gamma_attn: float,
-    tau_temp: float,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    price   = batch["price"].to(device)     # [B, K, d_p]
-    finance = batch["finance"].to(device)   # [B, K, d_f]
-    event   = batch["event"].to(device)     # [B, K, d_e]
-    news    = batch.get("news", None)
-    if news is not None and torch.is_tensor(news):
-        news = news.to(device)
+def iterate_loader(loader):
+    """
+    Unified iterator:
+    - If loader is dict: {year: DataLoader}, yields batches and sets batch['year']=year if missing.
+    - If loader is DataLoader (or iterable), yields batches directly.
+    """
+    if isinstance(loader, dict):
+        for year, dl in loader.items():
+            for b in dl:
+                if "year" not in b or b["year"] is None:
+                    # ensure it's a tensor
+                    b["year"] = torch.tensor(year)
+                yield b
+    else:
+        for b in loader:
+            # if loader yields (year, batch) tuple, handle that case
+            if isinstance(b, tuple) and len(b) == 2 and isinstance(b[0], int):
+                year, batch = b
+                if "year" not in batch or batch["year"] is None:
+                    batch["year"] = torch.tensor(year)
+                yield batch
+            else:
+                yield b
 
-    out   = model(price, finance, event, news)
-    pred  = out["pred"]                     # [B,1]
-    label = batch["label"].to(device)       # [B,1]
+# metrics
+@torch.no_grad()
+def smape(pred, target, eps=1e-8):
+    pred = pred.detach().cpu()
+    target = target.detach().cpu()
+    return (100 * torch.mean(
+        torch.abs(pred - target) / ((torch.abs(pred) + torch.abs(target)) / 2 + eps)
+    )).item()
 
-    # --- loss ---
-    mse_loss = F.mse_loss(pred, label)
+def compute_ic(preds_arr: np.ndarray, labels_arr: np.ndarray) -> float:
+    if len(preds_arr) > 1:
+        try:
+            return float(np.corrcoef(preds_arr, labels_arr)[0,1])
+        except Exception:
+            return float("nan")
+    return float("nan")
 
-    total = mse_loss   # 沒有 regs，直接 total=mse
+# -----------------------
+# evaluation (single function for both overall & per-year)
+# -----------------------
+def evaluate(model: nn.Module, loader, device: torch.device, tidx: int, per_year: bool = False):
+    model.eval()
+    total_loss = mse_sum = mae_sum = smape_sum = inter_sum = intra_sum = 0.0
+    n = 0
+    preds_list = []
+    labels_list = []
+
+    # per-year buckets if requested
+    buckets = defaultdict(lambda: {"mse": [], "mae": [], "smape": [], "preds": [], "labels": []})
 
     with torch.no_grad():
-        mse  = mse_loss.item()
-        rmse = math.sqrt(max(mse, 0.0))
-        mae  = F.l1_loss(pred, label).item()
-        smape_val = sMAPE(pred, label)
+        for batch in iterate_loader(loader):
+            # move and ensure batch dims
+            batch = move_to_device(batch, device)
+            # ensure tensors have batch dim [B,K,N,D] - model expects batch dim
+            price   = ensure_batch_dim(batch["price"]).to(device)
+            finance = ensure_batch_dim(batch["finance"]).to(device)
+            event   = ensure_batch_dim(batch["event"]).to(device)
+            network = ensure_batch_dim(batch["network"]).to(device)
+            news    = ensure_batch_dim(batch.get("news", None))
+            if news is not None:
+                news = news.to(device)
+            label = ensure_batch_dim(batch["label"]).to(device)
+            label = label[..., tidx:tidx+1]  # [B,N,1] or [1,N,1]
 
-    metrics = {
-        "total": total.item(),
-        "mse": mse, "rmse": rmse, "mae": mae, "smape": smape_val,
-        "L_intra": 0.0, "L_attn": 0.0, "L_temp": 0.0
-    }
-    return total, metrics
+            pred, slots, _ = model(price, finance, network, event, news)
+            loss_total, loss_mse, loss_inter, loss_intra = model.compute_losses(pred, label, slots)
 
-def run_one_epoch(model, loader, optimizer, device, train: bool, amp: bool,
-                  use_regs: bool, lambd_intra: float, gamma_attn: float, tau_temp: float,
-                  grad_clip: float = 1.0) -> Dict[str, float]:
-    model.train(mode=train)
-    scaler = GradScaler(enabled=amp)
+            mae = torch.abs(pred - label).mean().item()
+            smape_val = smape(pred, label)
 
-    agg = defaultdict(float)
-    n = 0
-    for batch in loader:
-        with autocast(enabled=amp):
-            loss, m = forward_and_loss(model, batch, device, use_regs, lambd_intra, gamma_attn, tau_temp)
-
-        if train:
-            optimizer.zero_grad(set_to_none=True)
-            if amp:
-                scaler.scale(loss).backward()
-                if grad_clip and grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if grad_clip and grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-
-        # 累積
-        for k, v in m.items():
-            agg[k] += float(v)
-        n += 1
-
-    return {k: (v / max(n, 1)) for k, v in agg.items()}
-
-@torch.no_grad()
-def evaluate_by_year(model, year_loaders: Dict[int, DataLoader], device,
-                     use_regs: bool, lambd_intra: float, gamma_attn: float, tau_temp: float) -> Dict[int, Dict[str, float]]:
-    model.eval()
-    results = {}
-    for y, loader in sorted(year_loaders.items()):
-        agg = defaultdict(float); n = 0
-        for batch in loader:
-            with autocast(enabled=False):
-                _, m = forward_and_loss(model, batch, device, use_regs, lambd_intra, gamma_attn, tau_temp)
-            for k, v in m.items():
-                agg[k] += float(v)
+            total_loss += loss_total.item()
+            mse_sum += loss_mse.item()
+            mae_sum += mae
+            smape_sum += smape_val
+            inter_sum += loss_inter.item()
+            intra_sum += loss_intra.item()
             n += 1
-        results[y] = {k: (v / max(n, 1)) for k, v in agg.items()}
-    return results
 
-# ---------------- Main ----------------
+            # flatten to 1d arrays for IC
+            preds_list.append(pred.cpu().numpy().ravel())
+            labels_list.append(label.cpu().numpy().ravel())
+
+            if per_year:
+                year = int(batch.get("year", -1))
+                buckets[year]["mse"].append(loss_mse.item())
+                buckets[year]["mae"].append(mae)
+                buckets[year]["smape"].append(smape_val)
+                buckets[year]["preds"].append(pred.cpu().numpy().ravel())
+                buckets[year]["labels"].append(label.cpu().numpy().ravel())
+
+    # overall metrics
+    preds = np.concatenate(preds_list) if preds_list else np.array([])
+    labels = np.concatenate(labels_list) if labels_list else np.array([])
+    ic = compute_ic(preds, labels)
+    avg_mse = mse_sum / max(n, 1)
+    avg_rmse = math.sqrt(avg_mse)
+    avg_mae = mae_sum / max(n, 1)
+    avg_smape = smape_sum / max(n, 1)
+    avg_inter = inter_sum / max(n, 1)
+    avg_intra = intra_sum / max(n, 1)
+    avg_total = total_loss / max(n, 1)
+
+    if not per_year:
+        return avg_total, avg_mse, avg_rmse, avg_mae, avg_smape, avg_inter, avg_intra, ic
+    else:
+        # compute per-year summary
+        results = {}
+        for y, d in buckets.items():
+            preds_y = np.concatenate(d["preds"]) if d["preds"] else np.array([])
+            labels_y = np.concatenate(d["labels"]) if d["labels"] else np.array([])
+            ic_y = compute_ic(preds_y, labels_y)
+            mse_y = sum(d["mse"]) / max(len(d["mse"]), 1)
+            mae_y = sum(d["mae"]) / max(len(d["mae"]), 1)
+            smape_y = sum(d["smape"]) / max(len(d["smape"]), 1)
+            rmse_y = math.sqrt(mse_y)
+            results[y] = (mse_y, rmse_y, mae_y, smape_y, ic_y)
+        return results
+
+# -----------------------
+# single epoch training
+# -----------------------
+def train_one_epoch(model, optimizer, scaler, train_loader, device, tidx, scheduler=None, epoch=0, grad_clip=GRAD_CLIP):
+    model.train()
+    running = {"total": 0.0, "mse": 0.0, "inter": 0.0, "intra": 0.0}
+    count = 0
+    pbar = tqdm(iterate_loader(train_loader), desc=f"Train Epoch {epoch:03d}")
+
+    for batch in pbar:
+        batch = move_to_device(batch, device)
+        price   = ensure_batch_dim(batch["price"]).to(device)
+        finance = ensure_batch_dim(batch["finance"]).to(device)
+        event   = ensure_batch_dim(batch["event"]).to(device)
+        network = ensure_batch_dim(batch["network"]).to(device)
+        news    = ensure_batch_dim(batch.get("news", None))
+        if news is not None:
+            news = news.to(device)
+        label = ensure_batch_dim(batch["label"]).to(device)
+        label = label[..., tidx:tidx+1]
+
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == "cuda")):
+            pred, slots, _ = model(price, finance, network, event, news)
+            loss_total, loss_mse, loss_inter, loss_intra = model.compute_losses(pred, label, slots)
+
+        scaler.scale(loss_total).backward()
+        # unscale & clip
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+
+        if scheduler is not None:
+            # option A: step per batch (original code did this). If you prefer per-epoch, move out.
+            scheduler.step()
+
+        running["total"] += loss_total.item()
+        running["mse"] += loss_mse.item()
+        running["inter"] += loss_inter.item()
+        running["intra"] += loss_intra.item()
+        count += 1
+
+        pbar.set_postfix(total=f"{loss_total.item():.4f}", mse=f"{loss_mse.item():.4f}", inter=f"{loss_inter.item():.4f}", intra=f"{loss_intra.item():.4f}")
+
+    # average
+    for k in running:
+        running[k] = running[k] / max(count, 1)
+    return running
+
+# -----------------------
+# main
+# -----------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--target", choices=["env", "soc", "gov"], required=True)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--alpha", type=float, default=0.25)
+    p.add_argument("--lambd", type=float, default=10.0)
+    p.add_argument("--logdir", type=str, default="runs")
+    p.add_argument("--device", type=str, default="cuda")
+    return p.parse_args()
+
 def main():
-    parser = argparse.ArgumentParser()
-    # 路徑
-    parser.add_argument("--root_price", required=True)
-    parser.add_argument("--root_finance", required=True)
-    parser.add_argument("--root_news", required=True)
-    parser.add_argument("--root_event", required=True)
-    parser.add_argument("--root_label", required=True)
-    parser.add_argument("--root_year_symbols", required=True)
+    args = parse_args()
+    set_seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    tidx = {"env":0,"soc":1,"gov":2}[args.target]
+    print(f"Using device: {device}, target: {args.target}")
 
-    # 年份切分
-    parser.add_argument("--train_years", default="2015-2019")
-    parser.add_argument("--val_years",   default="2020-2021")
-    parser.add_argument("--test_years",  default="2022-2024")
+    run_name = datetime.now().strftime("DynScan_%Y%m%d-%H%M%S")
+    logdir = os.path.join(args.logdir, f"dynscan_{args.target}_{run_name}")
+    os.makedirs(logdir, exist_ok=True)
+    print(f"Logdir: {logdir}")
 
-    # 任務 / 資料
-    parser.add_argument("--task", choices=["E", "S", "G"], required=True, help="單任務訓練：E / S / G")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--pin_memory", action="store_true")
-
-    # 模型
-    parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--num_slots", type=int, default=6)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--bounded_output", action="store_true")
-
-    # 訓練
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
-
-    # 規則化（先建議設 0，穩定後逐步開）
-    parser.add_argument("--lambd_intra", type=float, default=0.0)  # slot 去相關
-    parser.add_argument("--gamma_attn",  type=float, default=0.0)  # 注意力熵
-    parser.add_argument("--tau_temp",    type=float, default=0.0)  # 時間平滑
-    parser.add_argument("--use_regs",    action="store_true")
-
-    # 輸出
-    parser.add_argument("--save_dir", default="./checkpoints")
-    parser.add_argument("--log_prefix", default="single_task")
-
-    args = parser.parse_args()
-    set_seed(args.seed)
-    os.makedirs(args.save_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    # ---- 建 Dataset（單公司、單任務 label）----
-    # label_mode 要與 task 對齊
-    label_mode = args.task
-    all_years = range(int(args.train_years.split("-")[0]), int(args.test_years.split("-")[1]) + 1)
-    dataset = ESGDataset(
-        root_price=args.root_price,
-        root_finance=args.root_finance,
-        root_news=args.root_news,
-        root_event=args.root_event,
-        root_label=args.root_label,
-        root_year_symbols=args.root_year_symbols,
-        years=all_years,
-        has_label=True,
-        label_mode=label_mode,        # "E"|"S"|"G" -> label shape [1]
-    )
-    print(f"Total samples: {len(dataset)}")
-
-    # ---- 切分（依年份 + 去掉無標/NaN 樣本）----
-    years_train = parse_year_span(args.train_years)
-    years_val   = parse_year_span(args.val_years)
-    years_test  = parse_year_span(args.test_years)
-
-    idx_train = filter_indices_by_year_and_label(dataset, years_train)
-    idx_val   = filter_indices_by_year_and_label(dataset, years_val)
-    idx_test  = filter_indices_by_year_and_label(dataset, years_test)
-
-    train_set = Subset(dataset, idx_train)
-    val_set   = Subset(dataset, idx_val)
-    test_set  = Subset(dataset, idx_test)
-
-    train_loader = create_loader(train_set, batch_size=args.batch_size, shuffle=True,
-                                 num_workers=args.num_workers, pin_memory=args.pin_memory)
-    val_loader   = create_loader(val_set, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=args.pin_memory)
-    test_loader  = create_loader(test_set, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=args.pin_memory)
-
-    # 每年 dataloader（for per-year metrics）
-    test_year_loaders = build_year_loaders(dataset, years_test, batch_size=args.batch_size,
-                                           num_workers=args.num_workers, pin_memory=args.pin_memory)
-
-    print(f"Train/Val/Test = {len(train_set)}/{len(val_set)}/{len(test_set)}")
-
-    # ---- Model / Optim ----
-    model = SlotESGSingleTaskSimple(
-        price_dim=dataset.price_dim,
-        finance_dim=dataset.finance_dim,
-        event_dim=dataset.event_dim,
-        news_dim=getattr(dataset, "news_dim", None),
-        hidden_dim=args.hidden_dim,
-        num_slots=args.num_slots,
-        dropout=args.dropout,
-        task=args.task,
-        bounded_output=args.bounded_output,
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    # ---- Train Loop ----
-    best_val = float("inf"); best_ep = -1
-    ckpt_path = os.path.join(args.save_dir, f"{args.log_prefix}_{args.task}_best.pt")
-
-    hist = {
-        "epoch": [],
-        "train_total": [], "train_mse": [], "train_rmse": [], "train_mae": [], "train_smape": [],
-        "val_total": [],   "val_mse": [],   "val_rmse": [],   "val_mae": [],   "val_smape": [],
-        "L_intra": [], "L_attn": [], "L_temp": []
+    # -------- dataset & loaders (uses your existing build_loaders) --------
+    root_paths = {
+        "price": "/home/sally/dataset/data_preprocessing/price_percentage",
+        "finance": "/home/sally/dataset/data_preprocessing/financial",
+        "news": "/home/sally/dataset/data_preprocessing/news/monthly_embeddings",
+        "event": "/home/sally/dataset/event_type/event_type_npy_newer",
+        "graph": "/home/sally/dataset/gkg_data/monthly_graph_new",
+        "label": "/home/sally/dataset/data_preprocessing/esg_label/esg_npy",
+        "year_symbols": "/home/sally/dataset/ticker/nyse/yearly_symbol"
     }
 
-    for ep in range(1, args.epochs + 1):
-        tr = run_one_epoch(
-            model, train_loader, optimizer, device,
-            train=True, amp=args.amp, use_regs=args.use_regs,
-            lambd_intra=args.lambd_intra, gamma_attn=args.gamma_attn, tau_temp=args.tau_temp,
-            grad_clip=1.0
-        )
-        vl = run_one_epoch(
-            model, val_loader, optimizer, device,
-            train=False, amp=False, use_regs=args.use_regs,
-            lambd_intra=args.lambd_intra, gamma_attn=args.gamma_attn, tau_temp=args.tau_temp
-        )
-        scheduler.step()
+    train_loader, val_loader, test_loader = build_loaders(
+        years_train=range(2015, 2020),
+        years_val=range(2020, 2022),
+        years_test=range(2022, 2025),
+        batch_size=args.batch_size,
+        root_paths=root_paths
+    )
 
-        print(f"[Epoch {ep:03d}][{args.task}] "
-              f"train_total={tr.get('total', float('nan')):.5f} "
-              f"val_total={vl.get('total', float('nan')):.5f}  "
-              f"(val_mse={vl.get('mse', float('nan')):.5f}  val_rmse={vl.get('rmse', float('nan')):.5f}  "
-              f"val_mae={vl.get('mae', float('nan')):.5f}  val_smape={vl.get('smape', float('nan')):.5f})")
+    # -------- model / optimizer / scheduler / amp --------
+    # to infer dims, you can still instantiate dataset to get dims if needed
+    sample_ds = GraphESGDataset(
+        root_price=root_paths["price"],
+        root_finance=root_paths["finance"],
+        root_news=root_paths["news"],
+        root_event=root_paths["event"],
+        root_graph=root_paths["graph"],
+        root_label=root_paths["label"],
+        root_year_symbols=root_paths["year_symbols"],
+        years=range(2015,2025),
+        has_label=True,
+        strict_check=True,
+        fill_missing_event="zeros",
+        fill_missing_graph="zeros",
+    )
+    model = DynScan(
+        price_dim=sample_ds.price_dim,
+        finance_dim=sample_ds.finance_dim,
+        event_dim=sample_ds.event_dim,
+        news_dim=sample_ds.news_dim,
+        hidden_dim=32,
+        num_slots=10,
+        dropout=0.1,
+        out_dim=1,
+        alpha=args.alpha,
+        lambd=args.lambd
+    ).to(device)
+    print("model first param device:", next(model.parameters()).device)
 
-        # 記錄
-        hist["epoch"].append(ep)
-        for k in ["total","mse","rmse","mae","smape","L_intra","L_attn","L_temp"]:
-            hist_key = ("train_" + k) if k in tr else None
-        hist["train_total"].append(tr.get("total", float("nan")))
-        hist["train_mse"].append(tr.get("mse", float("nan")))
-        hist["train_rmse"].append(tr.get("rmse", float("nan")))
-        hist["train_mae"].append(tr.get("mae", float("nan")))
-        hist["train_smape"].append(tr.get("smape", float("nan")))
-        hist["val_total"].append(vl.get("total", float("nan")))
-        hist["val_mse"].append(vl.get("mse", float("nan")))
-        hist["val_rmse"].append(vl.get("rmse", float("nan")))
-        hist["val_mae"].append(vl.get("mae", float("nan")))
-        hist["val_smape"].append(vl.get("smape", float("nan")))
-        hist["L_intra"].append(tr.get("L_intra", 0.0))
-        hist["L_attn"].append(tr.get("L_attn", 0.0))
-        hist["L_temp"].append(tr.get("L_temp", 0.0))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
-        # 儲存最好
-        val_total = vl.get("total", float("inf"))
-        if val_total < best_val - 1e-9:
-            best_val = val_total; best_ep = ep
+    # training history
+    history = defaultdict(list)
+    save_path = f"best_dynscan_{args.target}.pt"
+    best_val = float("inf")
+    best_epoch = -1
+
+    for epoch in range(1, args.epochs + 1):
+        train_stats = train_one_epoch(model, optimizer, scaler, train_loader, device, tidx,
+                                      scheduler=scheduler, epoch=epoch, grad_clip=GRAD_CLIP)
+
+        val_total, val_mse, val_rmse, val_mae, val_smape, val_inter, val_intra, val_ic = evaluate(model, val_loader, device, tidx, per_year=False)
+        train_total, train_mse, train_rmse, train_mae, train_smape, train_inter, train_intra, train_ic = evaluate(model, train_loader, device, tidx, per_year=False)
+
+        # record
+        history["epoch"].append(epoch)
+        history["train_total"].append(train_total); history["train_mse"].append(train_mse); history["train_ic"].append(train_ic)
+        history["val_total"].append(val_total); history["val_mse"].append(val_mse); history["val_ic"].append(val_ic)
+
+        print(f"[Epoch {epoch}] train_total={train_total:.4f} val_total={val_total:.4f} val_ic={val_ic:.4f}")
+
+        # checkpoint
+        if val_total < best_val - 1e-8:
+            best_val = val_total
+            best_epoch = epoch
             torch.save({
-                "epoch": ep,
+                "epoch": epoch,
                 "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
+                "optim_state": optimizer.state_dict(),
                 "val_total": val_total
-            }, ckpt_path)
-            print(f">>> Save best @ epoch {ep}: val_total={val_total:.5f} -> {ckpt_path}")
+            }, save_path)
+            print(f">>> Saved best model @ epoch {epoch} (val_total={val_total:.4f})")
 
+        # optionally free cuda mem
         torch.cuda.empty_cache()
 
-    # ---- 存歷史/曲線 ----
-    df_hist = pd.DataFrame(hist)
-    csv_path = os.path.join(args.save_dir, f"{args.log_prefix}_{args.task}_history.csv")
-    df_hist.to_csv(csv_path, index=False)
-    print(f"Saved history -> {csv_path}")
+    # save history
+    df_hist = pd.DataFrame(history)
+    hist_path = os.path.join(logdir, f"history_{args.target}.csv")
+    df_hist.to_csv(hist_path, index=False)
+    print(f"Saved history to {hist_path}")
 
-    plt.figure(figsize=(10,5))
-    plt.plot(df_hist["epoch"], df_hist["train_mse"], label="Train MSE")
-    plt.plot(df_hist["epoch"], df_hist["val_mse"],   label="Val MSE")
-    plt.xlabel("Epoch"); plt.ylabel("MSE"); plt.title(f"{args.task} - Train vs Val MSE")
-    plt.grid(True); plt.legend()
-    fig_path = os.path.join(args.save_dir, f"{args.log_prefix}_{args.task}_curves.png")
-    plt.savefig(fig_path, dpi=300); plt.close()
-    print(f"Saved curves -> {fig_path}")
-
-    # ---- 測試 ----
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # load best and test + per-year
+    ckpt = torch.load(save_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
-    print(f"Loaded best @ epoch={ckpt['epoch']}  val_total={ckpt['val_total']:.5f}")
+    print(f"Loaded best ckpt epoch={ckpt['epoch']}, val_total={ckpt['val_total']:.4f}")
 
-    te = run_one_epoch(
-        model, test_loader, optimizer=None, device=device,
-        train=False, amp=False, use_regs=args.use_regs,
-        lambd_intra=args.lambd_intra, gamma_attn=args.gamma_attn, tau_temp=args.tau_temp
-    )
-    print(f"[TEST {args.task}] total={te.get('total', float('nan')):.5f}  "
-          f"mse={te.get('mse', float('nan')):.5f}  rmse={te.get('rmse', float('nan')):.5f}  "
-          f"mae={te.get('mae', float('nan')):.5f}  smape={te.get('smape', float('nan')):.5f}")
+    test_metrics = evaluate(model, test_loader, device, tidx, per_year=False)
+    print(f"[TEST] {test_metrics}")
 
-    # ---- 每年 metrics ----
-    year_results = evaluate_by_year(
-        model, test_year_loaders, device,
-        use_regs=args.use_regs, lambd_intra=args.lambd_intra, gamma_attn=args.gamma_attn, tau_temp=args.tau_temp
-    )
+    yearly_results = evaluate(model, test_loader, device, tidx, per_year=True)
+
+    # save yearly results
     rows = []
-    print(f"\n[TEST per-year — task={args.task}]")
-    for y, m in year_results.items():
-        rows.append({"year": y, "mse": m.get("mse", float("nan")),
-                     "rmse": m.get("rmse", float("nan")),
-                     "mae": m.get("mae", float("nan")),
-                     "smape": m.get("smape", float("nan"))})
-        print(f"Year {y}: mse={m.get('mse', float('nan')):.5f}  rmse={m.get('rmse', float('nan')):.5f}  "
-              f"mae={m.get('mae', float('nan')):.5f}  smape={m.get('smape', float('nan')):.5f}")
-    df_year = pd.DataFrame(rows).sort_values("year")
-    per_year_csv = os.path.join(args.save_dir, f"{args.log_prefix}_{args.task}_per_year.csv")
-    df_year.to_csv(per_year_csv, index=False)
-    print(f"Saved per-year -> {per_year_csv}")
+    for y,(mse,rmse,mae,smape_val,ic) in sorted(yearly_results.items()):
+        rows.append({"year": y, "mse": mse, "rmse": rmse, "mae": mae, "smape": smape_val, "ic": ic})
+        print(f"Year {y}: mse={mse:.4f} rmse={rmse:.4f} mae={mae:.4f} smape={smape_val:.4f} ic={ic:.4f}")
+    pd.DataFrame(rows).to_csv(os.path.join(logdir, f"yearly_{args.target}.csv"), index=False)
 
-    # ---- 散點圖 (Output vs Label) ----
+    # 儲存 Test predictions + labels -> CSV（每列: year, symbol, pred, label）
+    # 放在載入 best checkpoint並跑完 test/evaluate 之後執行
+
+    def _ensure_symbol_list(batch, N):
+        """
+        取得 symbols list（長度 N）。
+        支援 batch["symbols"] 為 list / numpy array / torch tensor / None
+        """
+        cand_names = None
+        for key in ["symbols", "symbol", "ticker", "tickers", "names"]:
+            if key in batch and batch[key] is not None:
+                cand_names = batch[key]
+                break
+
+        if cand_names is None:
+            # fallback: use index-based names
+            return [f"node_{i}" for i in range(N)]
+
+        # convert different types to python list of str
+        if isinstance(cand_names, list):
+            names = list(cand_names)
+        elif isinstance(cand_names, np.ndarray):
+            names = cand_names.tolist()
+        elif torch.is_tensor(cand_names):
+            try:
+                # if tensor of strings (rare), convert to numpy
+                names = cand_names.cpu().numpy().tolist()
+            except Exception:
+                # numeric tensor: treat as indices
+                names = [str(int(x)) for x in cand_names.cpu().numpy().ravel()]
+        else:
+            # unknown type: coerce to list
+            try:
+                names = list(cand_names)
+            except Exception:
+                names = [str(cand_names)] * N
+
+        # sometimes symbols are per-node w/o batch dim or per-batch; ensure length N
+        # If names is nested (e.g., per-batch list), try to unwrap
+        if len(names) == 0:
+            return [f"node_{i}" for i in range(N)]
+        if len(names) == N:
+            return [str(x) for x in names]
+        # if shapes like [B, N] where B=1
+        if len(names) == 1 and isinstance(names[0], (list, np.ndarray)):
+            sub = names[0]
+            if len(sub) == N:
+                return [str(x) for x in sub]
+        # otherwise fallback to index labels
+        return [f"node_{i}" for i in range(N)]
+
+    # 實作：collect all preds/labels/symbol/year -> DataFrame -> CSV
+    def save_test_predictions_csv(model, test_loader, device, tidx, save_path="preds_labels.csv"):
+        model.eval()
+        rows = []
+        with torch.no_grad():
+            # 支援 test_loader 為 dict(year -> DataLoader) 或單一 DataLoader
+            if isinstance(test_loader, dict):
+                for year, dl in test_loader.items():
+                    for batch in dl:
+                        # move to device & ensure batch dim
+                        batch_dev = move_to_device(batch, device)
+                        price   = ensure_batch_dim(batch_dev["price"]).to(device)
+                        finance = ensure_batch_dim(batch_dev["finance"]).to(device)
+                        event   = ensure_batch_dim(batch_dev["event"]).to(device)
+                        network = ensure_batch_dim(batch_dev["network"]).to(device)
+                        news    = ensure_batch_dim(batch_dev.get("news", None))
+                        if news is not None:
+                            news = news.to(device)
+                        label = ensure_batch_dim(batch_dev["label"]).to(device)[..., tidx:tidx+1]  # [B,N,1]
+
+                        pred, slots, _ = model(price, finance, network, event, news)  # pred: [B,N,1]
+
+                        # flatten B dimension (we usually have B=1)
+                        pred_np = pred.cpu().numpy().reshape(-1)   # (B*N,)
+                        label_np = label.cpu().numpy().reshape(-1) # (B*N,)
+
+                        # attempt to get symbols (per-node)
+                        # original batch may have symbols without batch dim (N,) or with batch dim (B,N)
+                        # we prefer `batch["symbols"]` from original batch (not moved to device)
+                        symbols = _ensure_symbol_list(batch, N=pred_np.shape[0] if pred_np.shape[0] > 0 else pred.shape[1])
+
+                        # If symbols length != number of nodes, try to derive from shape (B,N) case:
+                        if len(symbols) != pred_np.shape[0]:
+                            # if original batch has batch dim and B==1, unwrap
+                            if "symbols" in batch and hasattr(batch["symbols"], "__len__"):
+                                try:
+                                    # try to flatten and force length
+                                    flat = np.array(batch["symbols"]).ravel().tolist()
+                                    if len(flat) >= pred_np.shape[0]:
+                                        symbols = [str(x) for x in flat[:pred_np.shape[0]]]
+                                except Exception:
+                                    pass
+
+                        # ensure length again
+                        if len(symbols) != pred_np.shape[0]:
+                            # fallback to node_{i}
+                            symbols = [f"node_{i}" for i in range(pred_np.shape[0])]
+
+                        # append rows
+                        for i, sym in enumerate(symbols):
+                            rows.append({
+                                "year": int(year),
+                                "symbol": str(sym),
+                                "pred": float(pred_np[i]),
+                                "label": float(label_np[i]),
+                                "error": float(pred_np[i]-label_np[i])
+                            })
+            else:
+                # loader not dict: iterate and try to use batch["year"] if present
+                for batch in test_loader:
+                    batch_dev = move_to_device(batch, device)
+                    price   = ensure_batch_dim(batch_dev["price"]).to(device)
+                    finance = ensure_batch_dim(batch_dev["finance"]).to(device)
+                    event   = ensure_batch_dim(batch_dev["event"]).to(device)
+                    network = ensure_batch_dim(batch_dev["network"]).to(device)
+                    news    = ensure_batch_dim(batch_dev.get("news", None))
+                    if news is not None:
+                        news = news.to(device)
+                    label = ensure_batch_dim(batch_dev["label"]).to(device)[..., tidx:tidx+1]
+
+                    pred, slots, _ = model(price, finance, network, event, news)
+
+                    pred_np = pred.cpu().numpy().reshape(-1)
+                    label_np = label.cpu().numpy().reshape(-1)
+
+                    year = int(batch.get("year", -1)) if "year" in batch else -1
+                    symbols = _ensure_symbol_list(batch, N=pred_np.shape[0])
+
+                    if len(symbols) != pred_np.shape[0]:
+                        symbols = [f"node_{i}" for i in range(pred_np.shape[0])]
+
+                    for i, sym in enumerate(symbols):
+                        rows.append({
+                            "year": year,
+                            "symbol": str(sym),
+                            "pred": float(pred_np[i]),
+                            "label": float(label_np[i]),
+                            "errors": float(pred_np[i]-label[i])
+                        })
+
+        # save DataFrame
+        if len(rows) == 0:
+            print("[save_test_predictions_csv] Warning: no rows collected; CSV not written.")
+            return
+
+        df = pd.DataFrame(rows)
+        # 排序：先 year 再 symbol
+        df = df.sort_values(["year", "symbol"]).reset_index(drop=True)
+        df.to_csv(save_path, index=False)
+        df["abs_error"] = (df["pred"]-df["label"]).abs()
+        print(f"[save_test_predictions_csv] saved {len(df)} rows to {save_path}")
+
+    save_csv_path = f"preds_labels_{args.target}.csv"
+    save_test_predictions_csv(model, test_loader, device, tidx, save_path=save_csv_path)
+
+
+    # scatter plot (outputs vs labels)
+    all_out, all_label = [], []
     model.eval()
-    outs, tgts = [], []
     with torch.no_grad():
-        for batch in test_loader:
-            price   = batch["price"].to(device)
-            finance = batch["finance"].to(device)
-            event   = batch["event"].to(device)
-            news    = batch.get("news", None)
-            if news is not None and torch.is_tensor(news): news = news.to(device)
-            out  = model(price, finance, event, news)
-            pred = out["pred"]
-            label= batch["label"].to(device)
-            outs.append(pred.detach().cpu().view(-1))
-            tgts.append(label.detach().cpu().view(-1))
-    outs = torch.cat(outs).numpy()
-    tgts = torch.cat(tgts).numpy()
+        for batch in iterate_loader(test_loader):
+            batch = move_to_device(batch, device)
+            price = ensure_batch_dim(batch["price"]).to(device)
+            finance = ensure_batch_dim(batch["finance"]).to(device)
+            event = ensure_batch_dim(batch["event"]).to(device)
+            network = ensure_batch_dim(batch["network"]).to(device)
+            news = ensure_batch_dim(batch.get("news", None))
+            if news is not None: news = news.to(device)
+            label = ensure_batch_dim(batch["label"]).to(device)[..., tidx:tidx+1]
+            pred, *_ = model(price, finance, network, event, news)
+            all_out.append(pred.cpu().view(-1))
+            all_label.append(label.cpu().view(-1))
+    if all_out:
+        all_out = torch.cat(all_out).numpy()
+        all_label = torch.cat(all_label).numpy()
+        plt.figure(figsize=(6,6))
+        plt.scatter(all_label, all_out, alpha=0.5)
+        mn = min(all_label.min(), all_out.min())
+        mx = max(all_label.max(), all_out.max())
+        plt.plot([mn,mx],[mn,mx],'r--')
+        plt.xlabel("True"); plt.ylabel("Pred")
+        plt.title(f"Scatter {args.target}")
+        plt.savefig(os.path.join(logdir, f"scatter_{args.target}.png"), dpi=300)
+        plt.close()
+        print(f"Saved scatter to {os.path.join(logdir, f'scatter_{args.target}.png')}")
+    print("model first param device:", next(model.parameters()).device)
 
-    plt.figure(figsize=(6,6))
-    plt.scatter(tgts, outs, alpha=0.5)
-    plt.xlabel("True Label"); plt.ylabel("Prediction")
-    plt.title(f"Scatter — {args.task}")
-    mn, mx = min(outs.min(), tgts.min()), max(outs.max(), tgts.max())
-    plt.plot([mn, mx], [mn, mx], "--")
-    scatter_path = os.path.join(args.save_dir, f"{args.log_prefix}_{args.task}_scatter.png")
-    plt.grid(True); plt.savefig(scatter_path, dpi=300); plt.close()
-    print(f"Saved scatter -> {scatter_path}")
+    
 
 if __name__ == "__main__":
     main()
