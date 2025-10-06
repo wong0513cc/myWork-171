@@ -17,3 +17,4 @@ done
 
 echo "done. Best checkpoints:"
 ls -lh best_dynscan_*.pt
+   

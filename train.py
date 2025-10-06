@@ -207,16 +207,13 @@ def train_one_epoch(model, optimizer, scaler, train_loader, device, tidx, schedu
             pred, slots, _ = model(price, finance, network, event, news)
             loss_total, loss_mse, loss_inter, loss_intra = model.compute_losses(pred, label, slots)
 
+        # after backward...
         scaler.scale(loss_total).backward()
-        # unscale & clip
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step optimizer via scaler
         scaler.step(optimizer)
         scaler.update()
-
-        if scheduler is not None:
-            # option A: step per batch (original code did this). If you prefer per-epoch, move out.
-            scheduler.step()
 
         running["total"] += loss_total.item()
         running["mse"] += loss_mse.item()
@@ -254,7 +251,8 @@ def main():
     print(f"Using device: {device}, target: {args.target}")
 
     run_name = datetime.now().strftime("DynScan_%Y%m%d-%H%M%S")
-    logdir = os.path.join(args.logdir, f"dynscan_{args.target}_{run_name}")
+    # logdir = os.path.join(args.logdir, f"dynscan_{args.target}_{run_name}")
+    logdir = "/home/sally/myWork"
     os.makedirs(logdir, exist_ok=True)
     print(f"Logdir: {logdir}")
 
@@ -263,7 +261,7 @@ def main():
         "price": "/home/sally/dataset/data_preprocessing/price_percentage",
         "finance": "/home/sally/dataset/data_preprocessing/financial",
         "news": "/home/sally/dataset/data_preprocessing/news/monthly_embeddings",
-        "event": "/home/sally/dataset/event_type/event_type_npy_newer",
+        "event": "/home/sally/dataset/data_preprocessing/event_type_PCA",
         "graph": "/home/sally/dataset/gkg_data/monthly_graph_new",
         "label": "/home/sally/dataset/data_preprocessing/esg_label/esg_npy",
         "year_symbols": "/home/sally/dataset/ticker/nyse/yearly_symbol"
@@ -305,7 +303,6 @@ def main():
         alpha=args.alpha,
         lambd=args.lambd
     ).to(device)
-    print("model first param device:", next(model.parameters()).device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -316,6 +313,71 @@ def main():
     save_path = f"best_dynscan_{args.target}.pt"
     best_val = float("inf")
     best_epoch = -1
+
+    # === DEBUG B: run one training step to inspect grads/param change ===
+    def run_one_step_debug(model, optimizer, scaler, loader, device, tidx):
+        print("=== DEBUG B: run_one_step_debug start ===")
+        model.train()
+        it = iter(iterate_loader(loader))
+        batch = next(it)  # first batch
+        batch = move_to_device(batch, device)
+        price   = ensure_batch_dim(batch["price"]).to(device)
+        finance = ensure_batch_dim(batch["finance"]).to(device)
+        event   = ensure_batch_dim(batch["event"]).to(device)
+        network = ensure_batch_dim(batch["network"]).to(device)
+        news    = ensure_batch_dim(batch.get("news", None))
+        if news is not None:
+            news = news.to(device)
+        label = ensure_batch_dim(batch["label"]).to(device)[..., tidx:tidx+1]
+
+        # snapshot a small subset of params (first param tensor)
+        first_param = next(model.parameters())
+        w_before = first_param.detach().cpu().clone()
+
+        # forward
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == "cuda")):
+            pred, slots, _ = model(price, finance, network, event, news)
+            loss_total, loss_mse, loss_inter, loss_intra = model.compute_losses(pred, label, slots)
+
+        print(f"[DEBUG B] loss_total={loss_total.item():.6f}, loss_mse={loss_mse.item():.6f}")
+        # backward + step (use scaler same as training)
+        scaler.scale(loss_total).backward()
+        scaler.unscale_(optimizer)
+
+        # grad norm
+        total_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                total_grad_norm += float(p.grad.detach().norm().item())
+        print(f"[DEBUG B] total_grad_norm (before clip) = {total_grad_norm:.6e}")
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+
+        # snapshot again
+        w_after = first_param.detach().cpu().clone()
+        change_norm = float((w_after - w_before).norm().item())
+        print(f"[DEBUG B] first_param change norm after step = {change_norm:.6e}")
+
+        # show a few pred vs label examples
+        pred_np = pred.detach().cpu().numpy().ravel()
+        label_np = label.detach().cpu().numpy().ravel()
+        for i in range(min(5, len(pred_np))):
+            print(f"[DEBUG B] sample {i}: pred={pred_np[i]:.6f}, label={label_np[i]:.6f}, err={pred_np[i]-label_np[i]:.6f}")
+
+        print("=== DEBUG B: run_one_step_debug end ===\n")
+        # we intentionally do not modify loader state; training can continue
+
+    # call it once before full training loop
+    try:
+        run_one_step_debug(model, optimizer, scaler, train_loader, device, tidx)
+    except StopIteration:
+        print("[DEBUG B] train_loader empty or iterate_loader yielded no batch.")
+    except Exception as e:
+        print("[DEBUG B] Exception during one-step debug:", e)
+
 
     for epoch in range(1, args.epochs + 1):
         train_stats = train_one_epoch(model, optimizer, scaler, train_loader, device, tidx,
@@ -345,6 +407,12 @@ def main():
 
         # optionally free cuda mem
         torch.cuda.empty_cache()
+        # train_one_epoch: remove any scheduler.step() calls inside here
+
+        # step scheduler once per epoch (after optimizer has been stepping inside train_one_epoch)
+        if scheduler is not None:
+            scheduler.step()
+
 
     # save history
     df_hist = pd.DataFrame(history)

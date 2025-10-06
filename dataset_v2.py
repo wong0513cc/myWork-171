@@ -28,7 +28,7 @@ class GraphESGDataset(Dataset):
         root_year_symbols=None,#  /data/year_symbol_list_csv
         years=range(2015, 2025),
         has_label=True,
-        event_dim=24544,
+        event_dim=64,
         strict_check=True,     # 檢查所有模態的 N 是否一致
         fill_missing_event="zeros",  # or "nan"
         fill_missing_graph="zeros"   # or "nan"
@@ -71,7 +71,7 @@ class GraphESGDataset(Dataset):
         months = [f"{m:02d}" for m in range(1, 13)]
         seq = []
         for mm in months:
-            fpath = os.path.join(self.root_event, f"event_{year}-{mm}.npy")
+            fpath = os.path.join(self.root_event, f"event_{year}-{mm}_pca64.npy")
             if os.path.exists(fpath):
                 arr = np.load(fpath)  # (N?, d_e)
                 # 若 N 不同，直接拋錯比較安全

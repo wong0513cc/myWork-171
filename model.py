@@ -359,7 +359,6 @@ class DynScan(nn.Module):
         H = H_out.reshape(B, N, K, self.D).permute(0, 2, 1, 3)  # [B,K,N,D]
         return H
         
-
     def forward(self,
                 price: torch.Tensor,
                 finance: torch.Tensor,
@@ -377,8 +376,7 @@ class DynScan(nn.Module):
         H_fin = self._encode_one_modality(finance, network, self.fin_proj, self.fin_norm)
         H_event = self._encode_one_modality(event, network, self.event_proj, self.event_norm)
         H_news = None
-        if self.has_news and news is not None:
-            H_news = self._encode_one_modality(news, network, self.news_proj, self.news_norm)
+        H_news = self._encode_one_modality(news, network, self.news_proj, self.news_norm)
 
         # slot concepts (shared encoder)
         S_price, B_price = self.slot_enc(H_price)
@@ -446,6 +444,28 @@ class DynScan(nn.Module):
         mask: [B,N] or [B,N,1] (1 valid)
         returns: total, mse, L_inter, L_intra
         """
+        # --- DEBUG / SAFETY CHECKS: ensure pred/target shapes and no NaN/Inf ---
+        # Ensure shapes match
+        if pred.shape != target.shape:
+            # try common fixes: squeeze/unsqueeze last or batch dim
+            if pred.dim() == target.dim() + 1 and pred.size(0) == 1 and target.dim() >= 2:
+                target = target.unsqueeze(0)  # (N,1)->(1,N,1)
+            elif target.dim() == pred.dim() + 1 and target.size(0) == 1:
+                pred = pred.unsqueeze(0)
+        # final assert (will raise informative error if mismatch remains)
+        if pred.shape != target.shape:
+            raise RuntimeError(f"[compute_losses] pred/target shape mismatch: pred={pred.shape}, target={target.shape}")
+
+        # convert to float and guard against NaN/Inf
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e5, neginf=-1e5)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1e5, neginf=-1e5)
+
+        # quick NaN check before computing losses
+        if torch.isnan(pred).any() or torch.isnan(target).any():
+            print("[compute_losses] WARNING: NaN found in pred or target!")
+            print("pred stats:", torch.min(pred), torch.max(pred), torch.mean(pred))
+            print("target stats:", torch.min(target), torch.max(target), torch.mean(target))
+
         if alpha is None:
             alpha = self.alpha
         if lambd is None:
@@ -464,6 +484,17 @@ class DynScan(nn.Module):
 
         # Inter-modality CMD-like (use last timestep slots)
         S_last: List[torch.Tensor] = []
+        # --- CHECK slots for NaN / inf / extreme values ---
+        for kname, S in slots.items():
+            if S is None:
+                continue
+            S_last_step = S[:, -1]   # [B,S,D]
+            if torch.isnan(S_last_step).any() or torch.isinf(S_last_step).any():
+                print(f"[compute_losses] WARNING: NaN/Inf in slots for {kname} (last step).")
+                print(f"  stats - min {torch.min(S_last_step)}, max {torch.max(S_last_step)}, mean {torch.mean(S_last_step)}")
+                # sanitize to prevent NaNs propagating
+                slots[kname] = torch.nan_to_num(S, nan=0.0, posinf=1e5, neginf=-1e5)
+
         for key in ['price', 'finance', 'event', 'news']:
             if key in slots:
                 S_last.append(slots[key][:, -1])  # [B,S,D]
