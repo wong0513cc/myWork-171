@@ -481,6 +481,8 @@ class DynScan(nn.Module):
             mse = ((pred - target) ** 2 * mask).sum() / torch.clamp(mask.sum(), min=1.0)
         else:
             mse = F.mse_loss(pred, target)
+            # mse = torch.nan_to_num(mse, nan=0.0, posinf=1e5, neginf=-1e5)
+
 
         # Inter-modality CMD-like (use last timestep slots)
         S_last: List[torch.Tensor] = []
@@ -511,17 +513,31 @@ class DynScan(nn.Module):
             L_inter = L_inter / pair_cnt
 
         # Intra-modality disentanglement: off-diagonal cov of features (encourage diagonal dominance)
+        # def offdiag_cov_loss(S: torch.Tensor) -> torch.Tensor:
+        #     """
+        #     S: [B,S,D] -> compute mean squared off-diagonal elements of covariance across feature-dim
+        #     """
+        #     B, S_, D = S.shape
+        #     mean = S.mean(dim=1, keepdim=True)  # [B,1,D]
+        #     X = S - mean                         # [B,S,D]
+        #     # covariance across slots in feature space -> [B,D,D]
+        #     cov = torch.bmm(X.transpose(1, 2), X) / (S_ - 1 + 1e-6)
+        #     off_diag = cov - torch.diag_embed(torch.diagonal(cov, dim1=1, dim2=2))
+        #     return (off_diag ** 2).mean()
         def offdiag_cov_loss(S: torch.Tensor) -> torch.Tensor:
             """
-            S: [B,S,D] -> compute mean squared off-diagonal elements of covariance across feature-dim
+            更穩定版本：避免 slot cov loss 導致梯度爆炸。
             """
             B, S_, D = S.shape
-            mean = S.mean(dim=1, keepdim=True)  # [B,1,D]
-            X = S - mean                         # [B,S,D]
-            # covariance across slots in feature space -> [B,D,D]
+            mean = S.mean(dim=1, keepdim=True)
+            X = S - mean
+            X = torch.clamp(X, -1e3, 1e3)                     # 避免太大值
             cov = torch.bmm(X.transpose(1, 2), X) / (S_ - 1 + 1e-6)
+            cov = torch.nan_to_num(cov, nan=0.0, posinf=1e3, neginf=-1e3)
             off_diag = cov - torch.diag_embed(torch.diagonal(cov, dim1=1, dim2=2))
-            return (off_diag ** 2).mean()
+            loss_val = (off_diag ** 2).mean()
+            return loss_val
+
 
         L_intra = pred.new_tensor(0.0)
         cntm = 0
