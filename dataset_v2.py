@@ -5,6 +5,14 @@ import torch
 from torch.utils.data import Dataset
 import pandas as pd
 
+ROOT_PRICE="/home/sally/dataset/data_preprocessing/price_percentage"
+ROOT_FIN="/home/sally/dataset/data_preprocessing/financial"
+ROOT_NEWS="/home/sally/dataset/data_preprocessing/news/monthly_embeddings"
+ROOT_EVENT="/home/sally/dataset/data_preprocessing/event_type_PCA"
+ROOT_GRAPH="/home/sally/dataset/gkg_data/monthly_graph_new"
+ROOT_LABEL="/home/sally/dataset/data_preprocessing/esg_label/esg_npy"
+ROOT_SYMS="/home/sally/dataset/ticker/nyse/yearly_symbol"
+
 class GraphESGDataset(Dataset):
     """
     每個樣本＝一個年份
@@ -180,4 +188,22 @@ class GraphESGDataset(Dataset):
         sample = self.samples[idx]
         sample["year"] = torch.tensor(self.years[idx], dtype=torch.int32)
         return sample
+years = range(2015,2025)
 
+# ds = GraphESGDataset(
+#                 root_price=ROOT_PRICE,
+#                 root_finance=ROOT_FIN,
+#                 root_news=ROOT_NEWS,
+#                 root_event=ROOT_EVENT,
+#                 root_graph=ROOT_GRAPH,
+#                 root_label=ROOT_LABEL,
+#                 root_year_symbols=ROOT_SYMS,
+#                 years = range(2015,2025),
+#                 has_label=True,
+#                 strict_check=True,
+#                 fill_missing_event="zeros",
+#                 fill_missing_graph="zeros",
+#             )
+# sample = ds[1]
+# label = sample.get("label", None)
+# print(label.shape)

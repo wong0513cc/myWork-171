@@ -104,7 +104,7 @@ def compute_ic(preds_arr: np.ndarray, labels_arr: np.ndarray) -> float:
 # -----------------------
 def evaluate(model: nn.Module, loader, device: torch.device, tidx: int, per_year: bool = False):
     model.eval()
-    total_loss = mse_sum = mae_sum = smape_sum = inter_sum = intra_sum = 0.0
+    total_loss = mse_sum = mae_sum = smape_sum = 0.0
     n = 0
     preds_list = []
     labels_list = []
