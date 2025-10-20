@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from switchAttention import SwitchMultiModalBlock, PreNorm, MLP, SwitchEncoder
+
 # --------------------------
 # Utils
 # --------------------------
@@ -282,7 +284,7 @@ class ESGMultiModalModel(nn.Module):
             t = label_company                 # [B,1,N,1]
             valid = ~torch.isnan(t)
             diff2 = (torch.nan_to_num(p - t, nan=0.0) ** 2) * valid.float()
-            # 以「有效元素數」做平均
+            # 有效元素數做平均
             denom = valid.float().sum().clamp_min(1.0)
             mse_company = diff2.sum() / denom
 

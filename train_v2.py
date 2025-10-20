@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import matplotlib.colors as mcolors            # 新增：顏色轉換 HSV→RGB
 
-from model_test import ESGMultiModalModel
+from encoderSwitchAtt import ESGMultiModalModel
 from dataset_v2 import GraphESGDataset
 from dataloader import build_loaders 
 
@@ -122,18 +122,13 @@ def train_one_epoch(model: nn.Module,
                     raise RuntimeError("Model did not return 'losses' dict; ensure label is provided and loss enabled.")
                 loss = losses["total"]
 
-            # scaler.scale(loss).backward()
-            # if args.grad_clip is not None and args.grad_clip > 0:
-            #     scaler.unscale_(optimizer)
-            #     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # scaler.step(optimizer)
-            # scaler.update()
 
-            # 🔎 反傳前檢查 loss 是否有限
+
+            # 反傳前檢查 loss 是否有限
             if not torch.isfinite(loss):
                 print(f"[WARN] loss not finite at epoch {epoch}: {float(loss)}")
 
-            # 🔎 監看 AMP scale（出現 inf/NaN 會下降、甚至跳過 step）
+            # 監看 AMP scale（出現 inf/NaN 會下降、甚至跳過 step）
             scale_before = scaler.get_scale()
             scaler.scale(loss).backward()
             if args.grad_clip is not None and args.grad_clip > 0:
@@ -551,7 +546,7 @@ def main():
     ap.add_argument("--root_year_symbols", type=str, required=True)
     args = ap.parse_args()
 
-    set_seed(args.seed)
+    # set_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
