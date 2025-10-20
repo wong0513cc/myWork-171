@@ -17,6 +17,7 @@ import matplotlib.colors as mcolors            # 新增：顏色轉換 HSV→RGB
 
 from model_test import ESGMultiModalModel
 from dataset_v2 import GraphESGDataset
+from dataloader import build_loaders 
 
 TARGET2IDX = {"env": 0, "soc": 1, "gov": 2}
 
@@ -30,12 +31,13 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def smape(y_true, y_pred):
+def smape(y_true, y_pred, eps=1e-8, percent=True):
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
-    denom = (np.abs(y_true) + np.abs(y_pred))
-    denom[denom == 0] = 1.0
-    return np.mean(np.abs(y_pred - y_true) / denom)
+    num = 2.0 * np.abs(y_pred - y_true)
+    den = np.abs(y_true) + np.abs(y_pred) + eps
+    val = np.mean(num / den)
+    return val * 100.0 if percent else val
 
 def pearsonr_safe(x, y):
     x = np.asarray(x).ravel()
@@ -49,39 +51,12 @@ def pearsonr_safe(x, y):
         return np.nan
     return float(np.dot(xm, ym) / denom)
 
-def build_loaders(years_train, years_val, years_test, batch_size, root_paths, **kwargs):
-    """回傳 train/val/test 三個 dict，每個 dict 的 key 是年份，value 是 DataLoader"""
-    def make_loader(years, shuffle):
-        loaders = {}
-        for y in years:
-            ds = GraphESGDataset(
-                root_price=root_paths["price"],
-                root_finance=root_paths["finance"],
-                root_news=root_paths["news"],
-                root_event=root_paths["event"],
-                root_graph=root_paths["graph"],
-                root_label=root_paths["label"],
-                root_year_symbols=root_paths["year_symbols"],
-                years=[y],
-                has_label=True,
-                strict_check=True,
-                fill_missing_event="zeros",
-                fill_missing_graph="zeros",
-                **kwargs
-            )
-            # loaders[y] = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, collate_fn=lambda x: x[0])
-            loaders[y] = DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-        return loaders
-    train_loaders = make_loader(years_train, shuffle=True)
-    val_loaders   = make_loader(years_val,   shuffle=False)
-    test_loaders  = make_loader(years_test,  shuffle=False)
-    return train_loaders, val_loaders, test_loaders
+
 
 def select_labels_company_and_overall(label: torch.Tensor, target: str):
     """
     回傳：
       - label_company: [B,1,N,1]（年度、逐公司）
-      - label_overall: [B,1,1]  （年度、整體）
     """
     # 整到 [B,K,N,C]
     if label.ndim == 2:       # [N,C]
@@ -103,9 +78,7 @@ def select_labels_company_and_overall(label: torch.Tensor, target: str):
 
     # 年度聚合
     lab_company = lab.mean(dim=1, keepdim=True)  # [B,1,N,1]（沿 K）
-    lab_overall = lab_company.mean(dim=2, keepdim=True)  # [B,1,1,1]
-    lab_overall = lab_overall.squeeze(2)  # [B,1,1]
-    return lab_company, lab_overall
+    return lab_company
 
 # -------------------------------
 # Train/Eval
@@ -123,9 +96,8 @@ def move_inputs(batch: dict, device: torch.device, target: str):
     bd = {"price":price, "finance":finance, "news":news, "event":event}
     if "label" in batch and batch["label"] is not None:
         lab = to(batch["label"])
-        lab_company, lab_overall = select_labels_company_and_overall(lab, target)
+        lab_company= select_labels_company_and_overall(lab, target)
         bd["label_company"] = lab_company.to(device)  # [B,1,N,1]
-        bd["label_overall"] = lab_overall.to(device)  # [B,1,1]
     return bd
 
 
@@ -248,8 +220,7 @@ def evaluate(model: nn.Module,
 
         mae_y = float(np.abs(labels_y - preds_y).mean())
         rmse_y = math.sqrt(mse_y)
-        smape_y = float(np.mean(np.abs(preds_y - labels_y) /
-                                (np.abs(labels_y) + np.abs(preds_y) + 1e-6)))
+        smape_y = smape(labels_y, preds_y, eps=1e-8, percent=True)
         ic_company_y = pearsonr_safe(labels_y, preds_y)
 
         # 記錄年度明細
@@ -275,8 +246,7 @@ def evaluate(model: nn.Module,
         mse = float(((all_labels_company - all_preds_company)**2).mean())
         mae = float(np.abs(all_labels_company - all_preds_company).mean())
         rmse = math.sqrt(mse)
-        smape_all = float(np.mean(np.abs(all_preds_company - all_labels_company) /
-                                  (np.abs(all_labels_company) + np.abs(all_preds_company) + 1e-6)))
+        smape_all = smape(all_labels_company, all_preds_company, eps=1e-8, percent=True)
         ic_company = pearsonr_safe(all_labels_company, all_preds_company)
 
         metrics.update({"mse":mse,"mae":mae,"rmse":rmse,"smape":smape_all,
@@ -540,16 +510,6 @@ def save_test_year_metrics(per_year: Dict[int, dict], years: List[int], out_path
         # 如有缺漏，用 preds/labels 現算
         preds  = d.get("preds",  None)
         labels = d.get("labels", None)
-        if (preds is not None) and (labels is not None):
-            preds  = np.asarray(preds)
-            labels = np.asarray(labels)
-            if mse   is None: mse   = float(((labels - preds) ** 2).mean())
-            if mae   is None: mae   = float(np.abs(labels - preds).mean())
-            if rmse  is None: rmse  = float(np.sqrt(((labels - preds) ** 2).mean()))
-            if smape is None:
-                smape = float(np.mean(np.abs(preds - labels) / (np.abs(labels) + np.abs(preds) + 1e-6)))
-            if ic    is None:
-                ic = pearsonr_safe(labels, preds)
 
         rows.append({
             "year": int(y),
@@ -668,43 +628,10 @@ def main():
             history["val"].setdefault(k, []).append(val_metrics.get(k, float("nan")))
 
 
-        # ★ 新增：存這個 epoch 的 validation preds/labels
+        # # 存這個 epoch 的 validation preds/labels
         val_csv_path = os.path.join(args.out_dir, f"val_preds_epoch{epoch:03d}_{args.target}.csv")
         _ = save_split_preds_labels(val_detail, out_path=val_csv_path, split="val", epoch=epoch)
-        print(f"[VAL] Saved epoch {epoch} preds/labels to {val_csv_path}")
 
-        # # --- Save best checkpoint (robust) ---
-        # curr_mse = float(val_metrics.get("mse", float("inf")))
-
-        # if not math.isfinite(curr_mse):
-        #     print(f"[WARN] val MSE is not finite at epoch {epoch}: {curr_mse}")
-        # else:
-        #     improved = (curr_mse + 1e-9) < best_val  # min_delta 避免浮點誤差
-        #     if improved:
-        #         best_val = curr_mse
-        #         ckpt = {
-        #             "epoch": epoch,
-        #             "state_dict": model.state_dict(),
-        #             "optimizer": optimizer.state_dict(),
-        #             "val_mse": best_val,
-        #         }
-        #         try:
-        #             ckpt["scaler"] = scaler.state_dict()
-        #         except Exception:
-        #             pass
-        #         torch.save(ckpt, best_path)
-        #         print(f"[BEST] epoch {epoch} improved: val_mse={curr_mse:.6f} → saved to {best_path}")
-        #     else:
-        #         print(f"[BEST] no improve (best={best_val:.6f}, curr={curr_mse:.6f})")
-
-        # # （可選）每個 epoch 都存一份 last，方便排查參數是否在動
-        # last_path = os.path.join(args.out_dir, f"last_esg_{args.target}.pth")
-        # torch.save({
-        #     "epoch": epoch,
-        #     "state_dict": model.state_dict(),
-        #     "optimizer": optimizer.state_dict(),
-        #     "val_mse": curr_mse,
-        # }, last_path)
 
         # 存最優
         if val_metrics["mse"] < best_val:

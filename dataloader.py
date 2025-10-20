@@ -3,7 +3,6 @@ from dataset_v2 import GraphESGDataset
 
 def build_loaders(years_train, years_val, years_test, batch_size, root_paths, **kwargs):
     """回傳 train/val/test 三個 dict，每個 dict 的 key 是年份，value 是 DataLoader"""
-    
     def make_loader(years, shuffle):
         loaders = {}
         for y in years:
