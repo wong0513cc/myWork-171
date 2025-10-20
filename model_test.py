@@ -158,20 +158,26 @@ def information_coefficient_loss(pred: torch.Tensor, target: torch.Tensor, mode:
     else:
         raise ValueError("ic mode must be 'pearson' or 'spearman'")
     return -ic.mean()  # loss
-
+6                                                                                                                                                                                                                                                          
 
 # --------------------------
 # Main model (no cross-attn; concat then MLP)
 # --------------------------
 class ESGMultiModalModel(nn.Module):
     def __init__(self,
-                 d_price: int, d_finance: int, d_news: int, d_event: int,
+                 d_price: int, 
+                 d_finance: int, 
+                 d_news: int, 
+                 d_event: int,
                  hidden: int = 64,
-                 lstm_layers: int = 1, lstm_bidirectional: bool = False,
+                 lstm_layers: int = 1, 
+                 lstm_bidirectional: bool = False,
                  dropout: float = 0.1,
                  nhead_time: int = 4,
-                 news_layers: int = 2, event_layers: int = 2,
-                 ic_weight: float = 0.2, ic_type: str = "pearson"):
+                 news_layers: int = 2, 
+                 event_layers: int = 2,
+                 ic_weight: float = 0.2, 
+                 ic_type: str = "pearson"):
         super().__init__()
         self.ic_weight = ic_weight
         self.ic_type = ic_type
@@ -289,10 +295,10 @@ class ESGMultiModalModel(nn.Module):
                 rp = _rank_transform(pN, dim=1)
                 rt = _rank_transform(tN, dim=1)
                 ic_per_b = _pearson_corr(rp, rt, dim=1)
-            ic_loss = -ic_per_b.mean()
+            ic_loss = ic_per_b.mean()
 
             out["losses"] = {"mse": mse_company, "ic_company": ic_loss,
-                             "total": mse_company + self.ic_weight * ic_loss}
+                             "total": mse_company }
         return out
 
 

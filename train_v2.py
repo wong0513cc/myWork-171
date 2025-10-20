@@ -507,10 +507,6 @@ def save_test_year_metrics(per_year: Dict[int, dict], years: List[int], out_path
         smape = d.get("smape", None)
         ic    = d.get("ic_company", None)
 
-        # 如有缺漏，用 preds/labels 現算
-        preds  = d.get("preds",  None)
-        labels = d.get("labels", None)
-
         rows.append({
             "year": int(y),
             "mse": float(mse),

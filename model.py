@@ -405,11 +405,11 @@ class ESGMultiModalModel(nn.Module):
                 rp = _rank_transform(pN, dim=1)
                 rt = _rank_transform(tN, dim=1)
                 ic_per_b = _pearson_corr(rp, rt, dim=1)
-            ic_loss = -ic_per_b.mean()
+            ic_loss = ic_per_b.mean()
 
             out["losses"] = {"mse": mse_company,
                             "ic_company": ic_loss,
-                            "total": mse_company + self.ic_weight * ic_loss}
+                            "total": mse_company}
         return out
 
 
